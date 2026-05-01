@@ -16,6 +16,13 @@ on:
   push:
     branches: [main]
 
+# Required: grant the reusable workflow the permissions it needs.
+# Caller MUST grant these — caller's grant is the upper bound for the
+# reusable workflow. Without these, the run fails with startup_failure.
+permissions:
+  contents: read    # actions/checkout
+  packages: write   # docker push to GHCR
+
 jobs:
   deploy:
     uses: hemanth1986/gha-workflows/.github/workflows/dokploy-custom-app.yml@main
