@@ -1,0 +1,242 @@
+name: Dokploy Custom App Deploy (reusable)
+
+# Reusable workflow for any "custom app" deployed via Dokploy on the
+# innovspatial estate. Builds + pushes the GHCR image, triggers the
+# Dokploy compose deploy via Tailscale, then verifies the live app
+# is serving the new revision via the /ready endpoint.
+#
+# Caller pattern (in each app repo's .github/workflows/deploy.yml):
+#
+#   name: Build and Deploy
+#   on: { push: { branches: [main] } }
+#   jobs:
+#     deploy:
+#       uses: hemanth1986/gha-workflows/.github/workflows/dokploy-custom-app.yml@main
+#       with:
+#         app_host: biometric.innovspatial.app
+#         ghcr_image: ghcr.io/hemanth1986/biometric-sync
+#       secrets: inherit
+#
+# Required secrets in caller repo:
+#   DOKPLOY_API_TOKEN    — global Dokploy API key
+#   DOKPLOY_COMPOSE_ID   — per-app compose ID
+#   TS_OAUTH_CLIENT_ID   — Tailscale OAuth client (tag:ci)
+#   TS_OAUTH_SECRET      — Tailscale OAuth secret
+#
+# /ready endpoint contract (every custom app MUST implement):
+#   GET /ready -> 200 JSON
+#   {"status":"ready","version":"<from package.json>","revision":"<APP_REVISION env>","timestamp":"<ISO8601>"}
+# The revision MUST come from an APP_REVISION env baked at build time
+# (this workflow passes it as a docker build-arg automatically).
+
+on:
+  workflow_call:
+    inputs:
+      app_host:
+        description: "Public hostname (Traefik routes by this Host header). e.g. biometric.innovspatial.app"
+        required: true
+        type: string
+      ghcr_image:
+        description: "Full GHCR image path (no tag). e.g. ghcr.io/hemanth1986/biometric-sync"
+        required: true
+        type: string
+      contabo_ts_ip:
+        description: "Contabo's Tailscale IP — readiness curl is forced through here so DOCKER-USER allows it. Default is correct for the current estate; only override if Contabo is replaced."
+        required: false
+        type: string
+        default: "100.83.140.7"
+      verify_iterations:
+        description: "Max poll iterations for verify step. 60 iterations × ~5s each = ~5 minutes."
+        required: false
+        type: number
+        default: 60
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Read version from package.json
+        id: version
+        run: echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push to GHCR
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            APP_REVISION=${{ github.sha }}
+          tags: |
+            ${{ inputs.ghcr_image }}:main
+            ${{ inputs.ghcr_image }}:${{ steps.version.outputs.version }}
+            ${{ inputs.ghcr_image }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Enforce Dokploy custom-app mode (autoDeploy=false)
+        env:
+          DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
+          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
+        run: |
+          compose=$(curl -fsS \
+            -H "x-api-key: $DOKPLOY_API_TOKEN" \
+            "http://${{ inputs.contabo_ts_ip }}:3000/api/compose.one?composeId=$DOKPLOY_COMPOSE_ID")
+          auto_deploy=$(echo "$compose" | jq -r '.autoDeploy')
+          if [ "$auto_deploy" != "false" ]; then
+            echo "Dokploy autoDeploy is $auto_deploy; disabling for GitHub-Actions-owned deploys"
+            payload=$(jq -n --arg composeId "$DOKPLOY_COMPOSE_ID" \
+              '{composeId: $composeId, autoDeploy: false}')
+            curl -fsS -X POST \
+              -H "Content-Type: application/json" \
+              -H "x-api-key: $DOKPLOY_API_TOKEN" \
+              -d "$payload" \
+              "http://${{ inputs.contabo_ts_ip }}:3000/api/compose.update" >/dev/null
+          fi
+
+      - name: Trigger Dokploy deploy
+        id: deploy-trigger
+        env:
+          DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
+          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
+        run: |
+          triggered_at=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+          echo "triggered_at=$triggered_at" >> "$GITHUB_OUTPUT"
+
+          previous_done=$(curl -fsS \
+            -H "x-api-key: $DOKPLOY_API_TOKEN" \
+            "http://${{ inputs.contabo_ts_ip }}:3000/api/deployment.allByCompose?composeId=$DOKPLOY_COMPOSE_ID" \
+            | jq -r --arg triggered_at "$triggered_at" \
+              '[.[] | select(.status == "done" and .createdAt < $triggered_at)] | sort_by(.createdAt) | reverse | .[0].deploymentId // ""')
+          echo "previous_done_deployment_id=$previous_done" >> "$GITHUB_OUTPUT"
+
+          payload=$(jq -n \
+            --arg composeId "$DOKPLOY_COMPOSE_ID" \
+            --arg title "GitHub Actions ${GITHUB_SHA}" \
+            --arg description "Run ${GITHUB_RUN_ID}: image already pushed to GHCR before this deploy" \
+            '{composeId: $composeId, title: $title, description: $description}')
+          body_file=$(mktemp)
+          http_code=$(curl -sS -o "$body_file" -w "%{http_code}" -X POST \
+            "http://${{ inputs.contabo_ts_ip }}:3000/api/compose.deploy" \
+            -H 'Content-Type: application/json' \
+            -H "x-api-key: $DOKPLOY_API_TOKEN" \
+            -d "$payload")
+          body=$(cat "$body_file")
+          echo "Response: $body"
+          echo "HTTP Status: $http_code"
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "::error::Deploy trigger failed with HTTP $http_code"
+            exit 1
+          fi
+          echo "Deploy triggered successfully"
+
+      - name: Verify deploy succeeded
+        env:
+          DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
+          DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
+          TRIGGERED_AT: ${{ steps.deploy-trigger.outputs.triggered_at }}
+          APP_HOST: ${{ inputs.app_host }}
+          CONTABO_TS_IP: ${{ inputs.contabo_ts_ip }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          MAX_ITERATIONS: ${{ inputs.verify_iterations }}
+        run: |
+          echo "Polling live $APP_HOST/ready and Dokploy deployment status..."
+          last_status="no deployment record yet"
+          for i in $(seq 1 "$MAX_ITERATIONS"); do
+            # Force the connection through Contabo's Tailscale IP — the
+            # GHA runner has Tailscale up but its public DNS resolves
+            # to Contabo's public IP, where DOCKER-USER drops non-Tailscale
+            # sources. --resolve makes curl dial the Tailscale IP while
+            # Traefik routes by Host header and the cert validates by SNI.
+            READY_RESPONSE=$(curl -fsS --max-time 10 \
+              --resolve "$APP_HOST:443:$CONTABO_TS_IP" \
+              "https://$APP_HOST/ready?revision=$EXPECTED_REVISION" || true)
+            READY_REVISION=$(echo "$READY_RESPONSE" | jq -r '.revision // empty' 2>/dev/null || true)
+            if [ "$READY_REVISION" = "$EXPECTED_REVISION" ]; then
+              echo "✅ Running app revision confirmed: $READY_REVISION"
+              exit 0
+            fi
+
+            RESPONSE=$(curl -s \
+              -H "x-api-key: $DOKPLOY_API_TOKEN" \
+              "http://$CONTABO_TS_IP:3000/api/deployment.allByCompose?composeId=$DOKPLOY_COMPOSE_ID")
+            DEPLOYMENT=$(echo "$RESPONSE" | jq -c --arg triggered_at "$TRIGGERED_AT" '
+              if type == "array" then
+                [.[] | select(.createdAt >= $triggered_at)] | sort_by(.createdAt) | reverse | .[0] // empty
+              else
+                empty
+              end
+            ')
+
+            if [ -z "$DEPLOYMENT" ]; then
+              echo "[$i/$MAX_ITERATIONS] Ready revision: ${READY_REVISION:-unavailable}; $last_status"
+              sleep 5
+              continue
+            fi
+
+            DEPLOYMENT_ID=$(echo "$DEPLOYMENT" | jq -r '.deploymentId')
+            STATUS=$(echo "$DEPLOYMENT" | jq -r '.status')
+            last_status="deployment $DEPLOYMENT_ID status: $STATUS"
+            echo "[$i/$MAX_ITERATIONS] Ready revision: ${READY_REVISION:-unavailable}; $last_status"
+            case "$STATUS" in
+              error)
+                ERROR=$(echo "$DEPLOYMENT" | jq -r '.errorMessage // "check Dokploy logs"')
+                echo "::error::Deploy failed: $ERROR"
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          echo "::error::App readiness endpoint did not report expected revision $EXPECTED_REVISION"
+          echo "Last Dokploy status: $last_status"
+          echo "$READY_RESPONSE" | head -c 500
+          echo
+          exit 1
+
+      - name: Auto-rollback on failure
+        if: failure()
+        env:
+          DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
+          ROLLBACK_ID: ${{ steps.deploy-trigger.outputs.previous_done_deployment_id }}
+        run: |
+          echo "::warning::Attempting rollback to last successful deployment"
+          if [ -n "$ROLLBACK_ID" ]; then
+            curl -s -X POST \
+              -H "x-api-key: $DOKPLOY_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"rollbackId\": \"$ROLLBACK_ID\"}" \
+              "http://${{ inputs.contabo_ts_ip }}:3000/api/rollback.rollback"
+            echo "Rolled back to deployment: $ROLLBACK_ID"
+          else
+            echo "::warning::No previous successful deployment found for rollback"
+          fi

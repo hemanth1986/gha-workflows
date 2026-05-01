@@ -1,0 +1,74 @@
+# gha-workflows
+
+Reusable GitHub Actions workflows for the **innovspatial** estate.
+
+## Workflows
+
+### `dokploy-custom-app.yml`
+
+Build, push, deploy, and verify a custom app via Dokploy + Tailscale + Traefik.
+
+**Caller pattern** (in each app repo's `.github/workflows/deploy.yml`):
+
+```yaml
+name: Build and Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    uses: hemanth1986/gha-workflows/.github/workflows/dokploy-custom-app.yml@main
+    with:
+      app_host: biometric.innovspatial.app
+      ghcr_image: ghcr.io/hemanth1986/biometric-sync
+    secrets: inherit
+```
+
+**Required secrets in caller repo:**
+
+| Secret | Source |
+|---|---|
+| `DOKPLOY_API_TOKEN` | global Dokploy API key (see `Infra/Secrets.md`) |
+| `DOKPLOY_COMPOSE_ID` | per-app compose ID |
+| `TS_OAUTH_CLIENT_ID` | Tailscale OAuth client (`tag:ci`) |
+| `TS_OAUTH_SECRET` | Tailscale OAuth secret |
+
+**`/ready` endpoint contract** — every custom app MUST implement:
+
+```
+GET /ready  ->  200 JSON
+{
+  "status": "ready",
+  "version": "<from package.json>",
+  "revision": "<APP_REVISION env, baked at build time>",
+  "timestamp": "<ISO8601>"
+}
+```
+
+The reusable workflow passes `APP_VERSION` and `APP_REVISION` as docker
+build-args, so the app's Dockerfile must declare them and pass them to
+the runtime as ENV:
+
+```dockerfile
+ARG APP_VERSION=unknown
+ARG APP_REVISION=unknown
+ENV APP_VERSION=$APP_VERSION \
+    APP_REVISION=$APP_REVISION
+```
+
+**Why `--resolve` is in the verify step** — public DNS for
+`*.innovspatial.app` resolves to Contabo's public IP, where the
+`DOCKER-USER` iptables chain DROPs non-Tailscale, non-office source
+IPs. The GHA runner connects to Tailscale (`tag:ci`) but its public
+egress is its own GitHub-hosted IP, not its Tailscale IP. Forcing
+curl to dial Contabo's Tailscale IP (`100.83.140.7`) while keeping
+the original Host header bypasses the public-DNS path: Traefik routes
+by Host header, the cert validates by SNI, DOCKER-USER allows the
+Tailscale source.
+
+## See also
+
+- Full pattern documentation: `Projects/Infra/19-CI-CD-Deploy-Workflow.md`
+- Server inventory (Tailscale IPs, target servers): `Projects/Infra/03-Servers-Devices.md`
+- Dokploy API reference: `Projects/Infra/12-Dokploy-API.md`
