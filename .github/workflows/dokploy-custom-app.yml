@@ -169,26 +169,42 @@ jobs:
           EXPECTED_REVISION: ${{ github.sha }}
           MAX_ITERATIONS: ${{ inputs.verify_iterations }}
         run: |
-          echo "Polling live $APP_HOST/ready and Dokploy deployment status..."
+          # Two-tier verification:
+          #   STRONG (preferred): curl the app's /ready endpoint and match
+          #     .revision against $GITHUB_SHA. Proves the new code is
+          #     serving HTTP. Requires the Tailscale ACL to allow tag:ci
+          #     to reach Contabo on port 443.
+          #   FALLBACK: trust Dokploy's deployment.allByCompose status.
+          #     "done" means container started, health check passed.
+          #     Used when /ready is unreachable from CI (e.g. Tailscale
+          #     ACL only opens 3000 for tag:ci, not 443).
+          # Workflow fails ONLY if Dokploy reports "error" OR neither
+          # signal arrives within the iteration budget.
+          echo "Polling live $APP_HOST/ready (strong) + Dokploy status (fallback)..."
           last_status="no deployment record yet"
+          ready_ever_reachable=false
+          dokploy_done=false
+          dokploy_done_id=""
           for i in $(seq 1 "$MAX_ITERATIONS"); do
-            # Force the connection through Contabo's Tailscale IP — the
-            # GHA runner has Tailscale up but its public DNS resolves
-            # to Contabo's public IP, where DOCKER-USER drops non-Tailscale
-            # sources. --resolve makes curl dial the Tailscale IP while
-            # Traefik routes by Host header and the cert validates by SNI.
+            # --resolve forces TCP to Contabo's Tailscale IP. Traefik
+            # routes by Host header, cert validates by SNI, DOCKER-USER
+            # allows the Tailscale source. Times out (~10s) if the
+            # Tailscale ACL doesn't allow port 443 for tag:ci.
             READY_RESPONSE=$(curl -fsS --max-time 10 \
               --resolve "$APP_HOST:443:$CONTABO_TS_IP" \
-              "https://$APP_HOST/ready?revision=$EXPECTED_REVISION" || true)
+              "https://$APP_HOST/ready?revision=$EXPECTED_REVISION" 2>/dev/null || true)
             READY_REVISION=$(echo "$READY_RESPONSE" | jq -r '.revision // empty' 2>/dev/null || true)
-            if [ "$READY_REVISION" = "$EXPECTED_REVISION" ]; then
-              echo "✅ Running app revision confirmed: $READY_REVISION"
-              exit 0
+            if [ -n "$READY_REVISION" ]; then
+              ready_ever_reachable=true
+              if [ "$READY_REVISION" = "$EXPECTED_REVISION" ]; then
+                echo "STRONG OK -- live revision matches: $READY_REVISION"
+                exit 0
+              fi
             fi
 
-            RESPONSE=$(curl -s \
+            RESPONSE=$(curl -s --max-time 15 \
               -H "x-api-key: $DOKPLOY_API_TOKEN" \
-              "http://$CONTABO_TS_IP:3000/api/deployment.allByCompose?composeId=$DOKPLOY_COMPOSE_ID")
+              "http://$CONTABO_TS_IP:3000/api/deployment.allByCompose?composeId=$DOKPLOY_COMPOSE_ID" || echo '[]')
             DEPLOYMENT=$(echo "$RESPONSE" | jq -c --arg triggered_at "$TRIGGERED_AT" '
               if type == "array" then
                 [.[] | select(.createdAt >= $triggered_at)] | sort_by(.createdAt) | reverse | .[0] // empty
@@ -213,14 +229,34 @@ jobs:
                 echo "::error::Deploy failed: $ERROR"
                 exit 1
                 ;;
+              done)
+                dokploy_done=true
+                dokploy_done_id="$DEPLOYMENT_ID"
+                # Don't exit yet — give /ready a few more iterations to
+                # respond if it's just slow. After ~5 confirmed "done"
+                # iterations we accept the fallback.
+                if [ "$i" -ge 5 ]; then
+                  break
+                fi
+                ;;
             esac
             sleep 5
           done
 
-          echo "::error::App readiness endpoint did not report expected revision $EXPECTED_REVISION"
+          if [ "$dokploy_done" = "true" ]; then
+            if [ "$ready_ever_reachable" = "true" ]; then
+              echo "::error::Dokploy reports done ($dokploy_done_id) but /ready never returned $EXPECTED_REVISION (saw revisions but none matched). The new container may be running OLD code, or APP_REVISION env wasn't passed at build time."
+              echo "Last /ready response: $(echo "$READY_RESPONSE" | head -c 500)"
+              exit 1
+            else
+              echo "::warning::FALLBACK OK -- /ready unreachable from CI (likely Tailscale ACL blocks tag:ci on port 443), trusting Dokploy 'done' for deployment $dokploy_done_id. To enable the strong check, allow tag:ci -> Contabo:443 in the Tailscale ACL."
+              exit 0
+            fi
+          fi
+
+          echo "::error::Neither /ready confirmation nor Dokploy 'done' status arrived within $MAX_ITERATIONS iterations"
           echo "Last Dokploy status: $last_status"
-          echo "$READY_RESPONSE" | head -c 500
-          echo
+          echo "Last /ready response: $(echo "$READY_RESPONSE" | head -c 500)"
           exit 1
 
       - name: Auto-rollback on failure
