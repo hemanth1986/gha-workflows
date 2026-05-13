@@ -36,7 +36,7 @@ jobs:
 
 | Secret | Source |
 |---|---|
-| `DOKPLOY_API_TOKEN` | global Dokploy API key (see `Infra/Secrets.md`) |
+| `DOKPLOY_API_TOKEN` | global Dokploy API key (see `Infra/Vault/Secrets.md`) |
 | `DOKPLOY_COMPOSE_ID` | per-app compose ID |
 | `TS_OAUTH_CLIENT_ID` | Tailscale OAuth client (`tag:ci`) |
 | `TS_OAUTH_SECRET` | Tailscale OAuth secret |
@@ -76,6 +76,6 @@ Tailscale source.
 
 ## See also
 
-- Full pattern documentation: `Projects/Infra/19-CI-CD-Deploy-Workflow.md`
-- Server inventory (Tailscale IPs, target servers): `Projects/Infra/03-Servers-Devices.md`
-- Dokploy API reference: `Projects/Infra/12-Dokploy-API.md`
+- Full pattern documentation: `Infra/Runbooks/Deployment/CI-CD-Deploy-Workflow.md`
+- Server inventory (Tailscale IPs, target servers): `Infra/Vault/Servers-Devices.md`
+- Dokploy API reference: `Infra/Runbooks/APIs/Dokploy-API.md`
