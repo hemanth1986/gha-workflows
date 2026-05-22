@@ -145,12 +145,21 @@ jobs:
           triggered_at=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
           echo "triggered_at=$triggered_at" >> "$GITHUB_OUTPUT"
 
-          previous_done=$(curl -fsS \
+          # Capture the previous successful deployment for diagnostics on
+          # failure. Both the deploymentId (Dokploy's internal record) and
+          # the commit sha (extracted from the deployment title set by
+          # this workflow at line ~157: "GitHub Actions <sha>") are
+          # exposed as outputs so the failure-message step can guide the
+          # operator to the correct revert target.
+          previous_done_json=$(curl -fsS \
             -H "x-api-key: $DOKPLOY_API_TOKEN" \
             "http://${{ inputs.contabo_ts_ip }}:3000/api/deployment.allByCompose?composeId=$DOKPLOY_COMPOSE_ID" \
-            | jq -r --arg triggered_at "$triggered_at" \
-              '[.[] | select(.status == "done" and .createdAt < $triggered_at)] | sort_by(.createdAt) | reverse | .[0].deploymentId // ""')
-          echo "previous_done_deployment_id=$previous_done" >> "$GITHUB_OUTPUT"
+            | jq -c --arg triggered_at "$triggered_at" \
+              '[.[] | select(.status == "done" and .createdAt < $triggered_at)] | sort_by(.createdAt) | reverse | .[0] // {}')
+          previous_done_id=$(echo "$previous_done_json" | jq -r '.deploymentId // ""')
+          previous_done_sha=$(echo "$previous_done_json" | jq -r '.title // ""' | grep -oE '[a-f0-9]{40}' | head -1)
+          echo "previous_done_deployment_id=$previous_done_id" >> "$GITHUB_OUTPUT"
+          echo "previous_done_sha=$previous_done_sha" >> "$GITHUB_OUTPUT"
 
           payload=$(jq -n \
             --arg composeId "$DOKPLOY_COMPOSE_ID" \
@@ -226,8 +235,23 @@ jobs:
               end
             ')
 
+            # Make MISMATCH explicit in the per-iter log. Without this,
+            # "saw revisions but none matched" only shows up in the final
+            # failure summary — operators couldn't tell at a glance
+            # whether /ready was unreachable (network/Tailscale issue)
+            # vs. reachable but returning the OLD container's revision
+            # (compose rolling-update race, old container still draining
+            # within stop_grace_period).
+            if [ -n "$READY_REVISION" ] && [ "$READY_REVISION" != "$EXPECTED_REVISION" ]; then
+              ready_label="$READY_REVISION (MISMATCH — want $EXPECTED_REVISION)"
+            elif [ -n "$READY_REVISION" ]; then
+              ready_label="$READY_REVISION"
+            else
+              ready_label="unavailable"
+            fi
+
             if [ -z "$DEPLOYMENT" ]; then
-              echo "[$i/$MAX_ITERATIONS] Ready revision: ${READY_REVISION:-unavailable}; $last_status"
+              echo "[$i/$MAX_ITERATIONS] Ready revision: $ready_label; $last_status"
               sleep 5
               continue
             fi
@@ -235,7 +259,7 @@ jobs:
             DEPLOYMENT_ID=$(echo "$DEPLOYMENT" | jq -r '.deploymentId')
             STATUS=$(echo "$DEPLOYMENT" | jq -r '.status')
             last_status="deployment $DEPLOYMENT_ID status: $STATUS"
-            echo "[$i/$MAX_ITERATIONS] Ready revision: ${READY_REVISION:-unavailable}; $last_status"
+            echo "[$i/$MAX_ITERATIONS] Ready revision: $ready_label; $last_status"
             case "$STATUS" in
               error)
                 ERROR=$(echo "$DEPLOYMENT" | jq -r '.errorMessage // "check Dokploy logs"')
@@ -246,9 +270,15 @@ jobs:
                 dokploy_done=true
                 dokploy_done_id="$DEPLOYMENT_ID"
                 # Don't exit yet — give /ready a few more iterations to
-                # respond if it's just slow. After ~5 confirmed "done"
-                # iterations we accept the fallback.
-                if [ "$i" -ge 5 ]; then
+                # respond if it's just slow. Dokploy fires "done" when
+                # `docker compose up -d` returns + healthcheck passes
+                # once, BEFORE Traefik's load balancer has finished
+                # migrating to the new container. With single-replica
+                # compose + stop_grace_period: 30s, the old container
+                # can still answer /ready (with the OLD revision) for
+                # up to 30s after "done". After ~10 confirmed "done"
+                # iterations (~50s) we accept the fallback.
+                if [ "$i" -ge 10 ]; then
                   break
                 fi
                 ;;
@@ -272,20 +302,43 @@ jobs:
           echo "Last /ready response: $(echo "$READY_RESPONSE" | head -c 500)"
           exit 1
 
-      - name: Auto-rollback on failure
+      - name: Deploy failed — manual recovery required
         if: failure()
         env:
-          DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
-          ROLLBACK_ID: ${{ steps.deploy-trigger.outputs.previous_done_deployment_id }}
+          EXPECTED_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ steps.deploy-trigger.outputs.previous_done_sha }}
+          PREVIOUS_DEPLOYMENT_ID: ${{ steps.deploy-trigger.outputs.previous_done_deployment_id }}
         run: |
-          echo "::warning::Attempting rollback to last successful deployment"
-          if [ -n "$ROLLBACK_ID" ]; then
-            curl -s -X POST \
-              -H "x-api-key: $DOKPLOY_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"rollbackId\": \"$ROLLBACK_ID\"}" \
-              "http://${{ inputs.contabo_ts_ip }}:3000/api/rollback.rollback"
-            echo "Rolled back to deployment: $ROLLBACK_ID"
+          # Dokploy's `rollback.rollback` endpoint operates on
+          # APPLICATION-level rollback snapshots (single-container apps
+          # with rollback explicitly enabled). Compose-based apps NEVER
+          # get a rollbackId — confirmed by inspecting deployment.allByCompose:
+          # every entry has rollbackId: null. The prior version of this
+          # step sent a deploymentId to that endpoint, got HTTP 400
+          # "Error input: Rolling back", and silently echoed
+          # "Rolled back to deployment: ..." anyway because the echo
+          # ran unconditionally. NOTHING WAS EVER ROLLED BACK.
+          #
+          # Phase 4 of the deploy-hardening plan will add a real rollback
+          # (compose.update APP_REVISION env to previous sha, then
+          # compose.deploy). Until then, fail loudly with the info the
+          # operator needs to recover by hand.
+          echo "::error::Deploy of $EXPECTED_SHA failed and was NOT auto-rolled back."
+          echo ""
+          echo "Compose-based Dokploy apps have no native rollback feature."
+          echo "Recover manually:"
+          echo ""
+          if [ -n "$PREVIOUS_SHA" ]; then
+            echo "  Previous successful revision: $PREVIOUS_SHA"
+            echo "  Previous Dokploy deployment ID: $PREVIOUS_DEPLOYMENT_ID"
+            echo ""
+            echo "  Option A (clean — recommended):"
+            echo "    cd <repo> && git revert $EXPECTED_SHA && git push origin main"
+            echo ""
+            echo "  Option B (force-reset, only if no other commits have landed since):"
+            echo "    cd <repo> && git reset --hard $PREVIOUS_SHA && git push --force-with-lease origin main"
           else
-            echo "::warning::No previous successful deployment found for rollback"
+            echo "  No previous successful deployment found in Dokploy history."
+            echo "  Check Dokploy UI for an earlier good revision, or roll back"
+            echo "  via the docker-compose.yml image tag override."
           fi
