@@ -63,6 +63,11 @@ on:
         required: false
         type: string
         default: "package.json"
+      smoke_compose_path:
+        description: "Path (relative to repo root) to a docker-compose file that orchestrates a pre-deploy smoke test — boots the just-pushed image alongside any required sidecars (DB, etc.) with per-service healthchecks, so `docker compose up --wait` proves the image actually starts cleanly + reaches its dependencies before Dokploy is triggered. Each app owns its own compose file because the stacks are heterogeneous (Postgres / MariaDB / SQLite+sidecar / no-DB). The app service in the compose MUST be named `app` and use the env var `APP_IMAGE` for its image (this workflow injects it). Empty string disables smoke (default)."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -108,6 +113,50 @@ jobs:
             ${{ inputs.ghcr_image }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Pre-deploy smoke test (opt-in via smoke_compose_path)
+        if: ${{ inputs.smoke_compose_path != '' }}
+        env:
+          # Compose file references ${APP_IMAGE} for the `app` service;
+          # we point it at the immutable sha tag we just pushed so smoke
+          # tests the exact bits the deploy will pull.
+          APP_IMAGE: ${{ inputs.ghcr_image }}:sha-${{ github.sha }}
+          COMPOSE_FILE: ${{ inputs.smoke_compose_path }}
+        run: |
+          set -e
+          if [ ! -f "$COMPOSE_FILE" ]; then
+            echo "::error::smoke_compose_path '$COMPOSE_FILE' not found in repo"
+            exit 1
+          fi
+
+          echo "Booting smoke stack from $COMPOSE_FILE with APP_IMAGE=$APP_IMAGE"
+          # --wait blocks until every service with a healthcheck reports
+          # healthy (or until --wait-timeout elapses). The `app` service in
+          # the compose MUST declare a healthcheck that probes the right
+          # endpoint (typically /ready for apps that probe their DB).
+          # A 120s timeout covers cold-start + first-migration time on the
+          # slowest stacks.
+          set +e
+          docker compose -f "$COMPOSE_FILE" up -d --wait --wait-timeout 120
+          smoke_exit=$?
+          set -e
+
+          # Always dump logs so the operator can see WHAT failed (not
+          # just THAT it failed). Grouped so the GHA UI collapses them
+          # on success and expands on failure.
+          echo "::group::smoke compose logs"
+          docker compose -f "$COMPOSE_FILE" logs --no-color 2>&1 || true
+          echo "::endgroup::"
+
+          # Tear down (volumes too — smoke state must never leak between
+          # runs, especially DB seed data).
+          docker compose -f "$COMPOSE_FILE" down --volumes --remove-orphans 2>&1 | tail -10 || true
+
+          if [ "$smoke_exit" -ne 0 ]; then
+            echo "::error::Smoke test failed (exit=$smoke_exit) — image $APP_IMAGE cannot start cleanly. Deploy aborted."
+            exit "$smoke_exit"
+          fi
+          echo "✓ Smoke test passed — proceeding to deploy"
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
