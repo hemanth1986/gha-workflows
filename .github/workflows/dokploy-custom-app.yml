@@ -49,10 +49,10 @@ on:
         type: string
         default: "100.83.140.7"
       verify_iterations:
-        description: "Max poll iterations for verify step. 60 iterations × ~5s each = ~5 minutes."
+        description: "Max poll iterations for verify step. 90 iterations × ~6-11s each = up to ~15 min, sized to cover slow/loaded deploys (e.g. a burst of simultaneous deploys on Contabo)."
         required: false
         type: number
-        default: 60
+        default: 90
       build_context:
         description: "Docker build context path (relative to repo root). Default '.' for repos with Dockerfile at the root."
         required: false
@@ -76,7 +76,7 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     concurrency:
       group: deploy-${{ github.repository }}
       cancel-in-progress: false
@@ -259,9 +259,9 @@ jobs:
           for i in $(seq 1 "$MAX_ITERATIONS"); do
             # --resolve forces TCP to Contabo's Tailscale IP. Traefik
             # routes by Host header, cert validates by SNI, DOCKER-USER
-            # allows the Tailscale source. Times out (~10s) if the
+            # allows the Tailscale source. Times out (~6s) if the
             # Tailscale ACL doesn't allow port 443 for tag:ci.
-            READY_RESPONSE=$(curl -fsS --max-time 10 \
+            READY_RESPONSE=$(curl -fsS --max-time 6 \
               --resolve "$APP_HOST:443:$CONTABO_TS_IP" \
               "https://$APP_HOST/ready?revision=$EXPECTED_REVISION" 2>/dev/null || true)
             READY_REVISION=$(echo "$READY_RESPONSE" | jq -r '.revision // empty' 2>/dev/null || true)
@@ -318,16 +318,24 @@ jobs:
               done)
                 dokploy_done=true
                 dokploy_done_id="$DEPLOYMENT_ID"
-                # Don't exit yet — give /ready a few more iterations to
-                # respond if it's just slow. Dokploy fires "done" when
+                # Don't exit yet. Dokploy fires "done" when
                 # `docker compose up -d` returns + healthcheck passes
                 # once, BEFORE Traefik's load balancer has finished
                 # migrating to the new container. With single-replica
                 # compose + stop_grace_period: 30s, the old container
                 # can still answer /ready (with the OLD revision) for
-                # up to 30s after "done". After ~10 confirmed "done"
-                # iterations (~50s) we accept the fallback.
-                if [ "$i" -ge 10 ]; then
+                # a while after "done".
+                #
+                # Fall back to trusting "done" (exit 0 after the loop)
+                # ONLY when /ready is unreachable — then the strong
+                # check is impossible and "done" is all we have. If
+                # /ready IS reachable but still stale, keep polling so
+                # the new container can take over (the STRONG check at
+                # the top exits 0 the moment .revision matches); a
+                # persistent mismatch then fails loudly after the full
+                # budget — a real "running old code" signal, not a
+                # 50s rolling-update drain race.
+                if [ "$ready_ever_reachable" = "false" ] && [ "$i" -ge 10 ]; then
                   break
                 fi
                 ;;
